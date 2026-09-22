@@ -89,14 +89,54 @@ ROOT = Path(__file__).parent
 DEFAULT_INPUT = ROOT / "Original.png"
 OUT_DIR = ROOT / "out"
 
-# The upstream filename uses capital-Q; resolve either casing for convenience.
-_gguf_candidates = [
-    ROOT / "Qwen-Image-2512-Q4_K_M.gguf",   # actual HuggingFace filename
-    ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested name
+# Ordered list of GGUF quants to try, best quality first.
+# Each entry is (label, [candidate paths]) — first existing path wins per entry.
+# On OOM the pipeline tears down and retries with the next entry automatically.
+GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
+    ("Q4_K_M (~13 GB)", [
+        ROOT / "Qwen-Image-2512-Q4_K_M.gguf",
+        ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested lowercase
+    ]),
+    ("Q2_K_M (~7 GB)", [
+        ROOT / "Qwen-Image-2512-Q2_K_M.gguf",
+        ROOT / "qwen-image-2512-Q2_K_M.gguf",
+    ]),
 ]
-GGUF_TRANSFORMER = next((p for p in _gguf_candidates if p.exists()), _gguf_candidates[0])
+
+def _resolve_gguf(candidates: list[Path]) -> Path | None:
+    """Return the first path in candidates that exists on disk, or None."""
+    return next((p for p in candidates if p.exists()), None)
+
+# Default transformer = best available quant right now (used by --transformer default).
+GGUF_TRANSFORMER = next(
+    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if p.exists()),
+    GGUF_FALLBACK_CHAIN[0][1][0],  # fallback to first path even if missing (gives clear error)
+)
 LIGHTNING_LORA = ROOT / "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
 EMBEDS_CACHE = ROOT / "embeds_cache.pt"
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Return True for any out-of-memory error across CUDA, MPS, and CPU."""
+    if isinstance(exc, MemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return any(k in msg for k in ("out of memory", "oom", "memory allocation"))
+    # torch.cuda.OutOfMemoryError is a subclass of RuntimeError, already covered.
+    return False
+
+
+def _free_pipeline(pipe) -> None:
+    """Aggressively release a pipeline and clear device caches."""
+    import gc
+    del pipe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 # HF repo used only for tiny configs and the ~250MB VAE.
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
@@ -302,24 +342,83 @@ def main() -> None:
     image = load_image(str(input_path))
     print(f"input: {input_path.name}  size={image.size}")
 
-    pipe = build_pipeline(transformer_path=args.transformer)
     embeds = torch.load(EMBEDS_CACHE, map_location="cpu", weights_only=False)
     print(f"embeds: pos={tuple(embeds['prompt_embeds'].shape)} neg={tuple(embeds['negative_prompt_embeds'].shape)}")
 
+    # Build the fallback sequence to attempt.
+    # If --transformer was given explicitly, respect it and skip auto-fallback.
+    explicit_transformer = args.transformer != GGUF_TRANSFORMER
+    if explicit_transformer:
+        attempt_chain = [(args.transformer.stem, args.transformer)]
+    else:
+        # Walk GGUF_FALLBACK_CHAIN; skip entries whose file isn't on disk yet.
+        attempt_chain = []
+        for label, cands in GGUF_FALLBACK_CHAIN:
+            p = _resolve_gguf(cands)
+            if p is not None:
+                attempt_chain.append((label, p))
+        if not attempt_chain:
+            raise SystemExit(
+                "No GGUF transformer found. Download at least one quant:\n"
+                "  Qwen-Image-2512-Q4_K_M.gguf  (~13 GB, best quality)\n"
+                "  Qwen-Image-2512-Q2_K_M.gguf  (~7 GB,  fallback)\n"
+                "from https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF"
+            )
+
     OUT_DIR.mkdir(exist_ok=True)
     stem = input_path.stem
-    # Include the transformer file tag only when it's not the default — keeps
-    # default filenames short, makes alt-model outputs distinguishable.
-    model_tag = "" if args.transformer == GGUF_TRANSFORMER else f"_{args.transformer.stem}"
-    for denoise in args.denoise:
-        clean_pil = run_once(
-            pipe, image, embeds,
-            denoise=denoise, steps=args.steps, seed=args.seed, passes=args.passes,
-        )
-        tag = f"_s{args.steps}_d{denoise:.3f}_p{args.passes}{model_tag}"
 
+    pipe = None
+    used_label = None
+    used_path = None
+
+    for label, transformer_path in attempt_chain:
+        if pipe is not None:
+            _free_pipeline(pipe)
+            pipe = None
+
+        print(f"[quant] trying {label}  ({transformer_path.name})")
+        try:
+            pipe = build_pipeline(transformer_path=transformer_path)
+            # Run a single denoise pass to confirm the quant fits in memory
+            # before committing to the full sweep.
+            _ = run_once(
+                pipe, image, embeds,
+                denoise=args.denoise[0], steps=args.steps,
+                seed=args.seed, passes=args.passes,
+            )
+            used_label = label
+            used_path = transformer_path
+            break   # success — keep this pipe for remaining denoise values
+        except BaseException as exc:
+            if _is_oom(exc) and not explicit_transformer:
+                next_entries = attempt_chain[attempt_chain.index((label, transformer_path)) + 1:]
+                if next_entries:
+                    print(f"[OOM] {label} ran out of memory — retrying with {next_entries[0][0]}")
+                    continue
+            raise   # non-OOM error or no fallback left — propagate
+
+    if pipe is None or used_path is None:
+        raise SystemExit("All quants exhausted without success.")
+
+    # Include the transformer quant tag when it differs from the best available
+    # (i.e. we fell back, or --transformer was explicit).
+    default_path = attempt_chain[0][1] if attempt_chain else used_path
+    model_tag = "" if used_path == default_path else f"_{used_path.stem}"
+
+    # The first denoise value was already run above to probe memory; reuse it.
+    denoise_queue = list(args.denoise)
+    first_denoise = denoise_queue.pop(0)
+
+    def _save(clean_pil, denoise):
+        tag = f"_s{args.steps}_d{denoise:.3f}_p{args.passes}{model_tag}"
         if args.restore:
-            final_pil = _restore(clean_pil, image, sigma=args.restore_sigma, mode=args.restore_mode, unsharp_strength=args.unsharp)
+            final_pil = _restore(
+                clean_pil, image,
+                sigma=args.restore_sigma,
+                mode=args.restore_mode,
+                unsharp_strength=args.unsharp,
+            )
             mode_tag = "" if args.restore_mode == "gaussian" else f"_{args.restore_mode}"
             final_path = OUT_DIR / f"{stem}_desynth{tag}_r{args.restore_sigma:g}{mode_tag}.png"
             final_pil.save(final_path)
@@ -332,6 +431,16 @@ def main() -> None:
             final_path = OUT_DIR / f"{stem}_desynth{tag}.png"
             clean_pil.save(final_path)
             print(f"  -> {final_path.relative_to(ROOT)}")
+
+    # The probe run result was discarded (we only used it to check for OOM).
+    # Re-run the first denoise value properly and save, then handle the rest.
+    for denoise in [first_denoise] + denoise_queue:
+        clean_pil = run_once(
+            pipe, image, embeds,
+            denoise=denoise, steps=args.steps,
+            seed=args.seed, passes=args.passes,
+        )
+        _save(clean_pil, denoise)
 
 
 if __name__ == "__main__":
