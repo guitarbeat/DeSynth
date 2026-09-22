@@ -159,11 +159,13 @@ if torch.cuda.is_available():
     COMPUTE_DTYPE = torch.bfloat16   # native on Ampere+
 elif torch.backends.mps.is_available():
     DEVICE = "mps"
-    COMPUTE_DTYPE = torch.float16    # bfloat16 ops incomplete on MPS
-    # By default PyTorch MPS aborts at ~70% memory use. Setting this to 0
-    # disables that guard entirely and lets macOS's memory compressor + SSD
-    # swap manage pressure instead — critical when the GGUF weights (already
-    # mmap'd from SSD) need to be paged in/out layer-by-layer.
+    # PyTorch 2.14 has solid bfloat16 MPS coverage. More importantly, the
+    # diffusers pipeline's image preprocessor naturally produces bfloat16
+    # tensors on MPS — using float16 here causes a dtype mismatch in the
+    # VAE encoder (Input bfloat16 vs bias float16). Keep bfloat16 throughout.
+    COMPUTE_DTYPE = torch.bfloat16
+    # Disable PyTorch's conservative MPS OOM guard (~70% threshold) so macOS's
+    # own memory compressor and SSD swap can manage pressure instead.
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 else:
     DEVICE = "cpu"
@@ -191,9 +193,9 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
 
     transformer = _load(
         QwenImageTransformer2DModel.from_single_file,
-        pretrained_model_link_or_path=str(transformer_path),
+        pretrained_model_link_or_path_or_dict=str(transformer_path),
         quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
-        torch_dtype=dtype,
+        dtype=dtype,
         config=QWEN_IMAGE_REPO,
         subfolder="transformer",
     )
@@ -202,7 +204,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         AutoencoderKLQwenImage.from_pretrained,
         pretrained_model_name_or_path=QWEN_IMAGE_REPO,
         subfolder="vae",
-        torch_dtype=dtype,
+        dtype=dtype,
     )
 
     # No text encoder loaded — embeds are precomputed.
@@ -213,7 +215,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         vae=vae,
         text_encoder=None,
         tokenizer=None,
-        torch_dtype=dtype,
+        dtype=dtype,
     )
 
     # Load LoRA via safetensors mmap so its 1.6 GB stays SSD-backed (same
