@@ -89,7 +89,12 @@ ROOT = Path(__file__).parent
 DEFAULT_INPUT = ROOT / "Original.png"
 OUT_DIR = ROOT / "out"
 
-GGUF_TRANSFORMER = ROOT / "qwen-image-2512-Q4_K_M.gguf"
+# The upstream filename uses capital-Q; resolve either casing for convenience.
+_gguf_candidates = [
+    ROOT / "Qwen-Image-2512-Q4_K_M.gguf",   # actual HuggingFace filename
+    ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested name
+]
+GGUF_TRANSFORMER = next((p for p in _gguf_candidates if p.exists()), _gguf_candidates[0])
 LIGHTNING_LORA = ROOT / "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
 EMBEDS_CACHE = ROOT / "embeds_cache.pt"
 
@@ -106,6 +111,21 @@ DEFAULT_DENOISE = 0.25
 # back maximum detail from the original without dragging the watermark along.
 DEFAULT_RESTORE_SIGMA = 1.95
 
+# ---------------------------------------------------------------------------
+# Device / dtype selection — CUDA > MPS (Apple Silicon) > CPU
+# ---------------------------------------------------------------------------
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    COMPUTE_DTYPE = torch.bfloat16   # native on Ampere+
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+    COMPUTE_DTYPE = torch.float16    # bfloat16 ops incomplete on MPS
+else:
+    DEVICE = "cpu"
+    COMPUTE_DTYPE = torch.float32    # bf16/fp16 are slow on CPU without HW support
+
+print(f"[device] {DEVICE}  dtype={COMPUTE_DTYPE}")
+
 
 def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2ImgPipeline:
     for p in (transformer_path, LIGHTNING_LORA, EMBEDS_CACHE):
@@ -114,7 +134,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
                 f"{p}\n(Run `python precompute_embeds.py` first if embeds_cache.pt is missing.)"
             )
 
-    dtype = torch.bfloat16
+    dtype = COMPUTE_DTYPE
 
     # Offline if cached; download once if not.
     def _load(loader, **kwargs):
@@ -155,8 +175,22 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
     pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
     pipe.set_adapters(["lightning"], adapter_weights=[0.8])
 
-    # Sequential offload is the only mode that fits a 10GB Q4 transformer in 8GB.
-    pipe.enable_sequential_cpu_offload()
+    # Offload strategy depends on available hardware.
+    #   CUDA:     sequential offload — moves one layer at a time, fits 13GB GGUF
+    #             in 8 GB VRAM (tested config from the original author).
+    #   MPS/CPU:  model-level offload — accelerate moves whole sub-modules;
+    #             sequential offload's internals are CUDA-only in diffusers.
+    #             On CPU this still runs entirely in system RAM.
+    if DEVICE == "cuda":
+        pipe.enable_sequential_cpu_offload()
+    else:
+        # enable_model_cpu_offload falls back to CPU→device per sub-module,
+        # which accelerate supports on MPS as of accelerate>=0.26.
+        try:
+            pipe.enable_model_cpu_offload(device=DEVICE)
+        except TypeError:
+            # Older accelerate doesn't accept 'device' kwarg — move manually.
+            pipe.enable_model_cpu_offload()
     pipe.vae.enable_tiling()
 
     return pipe
