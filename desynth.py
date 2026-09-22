@@ -160,6 +160,11 @@ if torch.cuda.is_available():
 elif torch.backends.mps.is_available():
     DEVICE = "mps"
     COMPUTE_DTYPE = torch.float16    # bfloat16 ops incomplete on MPS
+    # By default PyTorch MPS aborts at ~70% memory use. Setting this to 0
+    # disables that guard entirely and lets macOS's memory compressor + SSD
+    # swap manage pressure instead — critical when the GGUF weights (already
+    # mmap'd from SSD) need to be paged in/out layer-by-layer.
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 else:
     DEVICE = "cpu"
     COMPUTE_DTYPE = torch.float32    # bf16/fp16 are slow on CPU without HW support
@@ -211,8 +216,16 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         torch_dtype=dtype,
     )
 
-    # fuse_lora doesn't work with GGUF-packed base weights, use runtime adapter.
-    pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
+    # Load LoRA via safetensors mmap so its 1.6 GB stays SSD-backed (same
+    # strategy as the GGUF weights). safetensors.torch.load_file() memory-maps
+    # the file by default; tensors are only paged into RAM when accessed.
+    try:
+        from safetensors.torch import load_file as _st_load
+        _lora_sd = _st_load(str(LIGHTNING_LORA), device="cpu")
+        pipe.load_lora_weights(_lora_sd, adapter_name="lightning")
+    except Exception:
+        # Fallback: let diffusers handle it normally (heap allocation).
+        pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
     pipe.set_adapters(["lightning"], adapter_weights=[0.8])
 
     # Offload strategy depends on available hardware.
